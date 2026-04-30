@@ -1,0 +1,25 @@
+# Environment
+.env
+# .env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# venv
+nl2sql
+
+# logs (keep the folder, ignore the contents)
+logs/*.log
