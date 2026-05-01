@@ -7,7 +7,7 @@ A console application that accepts natural language questions and answers them b
 ## Assumptions
 - `employees.db` is committed to the repository intentionally so the evaluator can run the application without any database setup. This would not be appropriate in a production environment.
 - Questions are assumed to be in English.
-- Modification requests (update, delete, insert) are treated as out of scope. The spec frames the application as a question-answering and lookup tool, and all example queries are reads. DML operations are rejected with a plain-language message.
+- Modification requests (update, delete, insert) are treated as out of scope. The spec frames the application as a question-answering and lookup tool, and all example queries are reads. DML (except SELECT) operations are rejected with a plain-language message.
 - Conversation history is preserved for the duration of a session — follow-up questions and pronoun references ("those employees", "that person") resolve correctly within the same run. History resets when the application is restarted; there is no cross-session persistence.
 - Numeric results are rounded to 2 decimal places. Raw float values from SQLite (e.g. `143984.82333...`) are normalised by a Pydantic result model before display.
 - The LLM is instructed to add `LIMIT 25` to every query by default. Results are capped at 200 rows as a hard backstop. Users can ask for more rows explicitly (e.g. "show me all") and the LLM will omit the limit accordingly.
@@ -51,8 +51,8 @@ The app supports two LLM providers, selected via `LLM_PROVIDER`:
 
 | Provider | Env var | Model used |
 |---|---|---|
-| `anthropic` (default) | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` |
-| `gemini` | `GEMINI_API_KEY` | `gemini-3.1-pro-preview` |
+| `anthropic`  | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` |
+| `gemini` (default) | `GEMINI_API_KEY` | `gemini-3.1-pro-preview` |
 
 
 You only need the key for the provider you intend to use.
