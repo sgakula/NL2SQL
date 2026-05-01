@@ -12,7 +12,7 @@ A console application that accepts natural language questions and answers them b
 - Numeric results are rounded to 2 decimal places. Raw float values from SQLite (e.g. `143984.82333...`) are normalised by a Pydantic result model before display.
 - The LLM is instructed to add `LIMIT 25` to every query by default. Results are capped at 200 rows as a hard backstop. Users can ask for more rows explicitly (e.g. "show me all") and the LLM will omit the limit accordingly.
 - The ReAct loop attempts up to 3 Thought/Action/Observation steps per question. If a working query cannot be produced within 3 steps the question is declined with a plain-language message.
-- The guardrail applies at the SQL generation level; the application does not implement row-level security in the database itself.
+- The guardrail is enforced at two levels: the LLM is instructed via the system prompt to always include a department filter, and a post-generation check validates every branch of the generated SQL before it reaches the database. The application does not implement row-level security in the database itself.
 
 
 ---
@@ -93,7 +93,7 @@ set LLM_PROVIDER=anthropic
 
 ### 3. Query log
 
-The app writes to `logs/queries.log` automatically on first run. Every question, generated SQL, and outcome (OK, BLOCKED, UNSAFE, EXEC_ERROR) is recorded there with a timestamp. Nothing internal is printed to the console — the log is the only place the generated SQL appears.
+The app writes to `logs/queries.log` automatically on first run. Every question, generated SQL, and outcome (OK, REPAIRED, REACT_RETRY, BLOCKED) is recorded there with a timestamp. Nothing internal is printed to the console — the log is the only place the generated SQL appears.
 
 ---
 
@@ -106,6 +106,7 @@ python src/main.py
 Example session:
 
 ```
+[INFO] Provider: anthropic
 [INFO] Department selected: Engineering
 [INFO] All queries are scoped to the 'Engineering' department.
 [INFO] Type a question, or 'exit' / 'quit' to stop.
@@ -182,7 +183,7 @@ All queries and outcomes (OK, REPAIRED, REACT_RETRY, BLOCKED) are written to `lo
 |---|---|
 | Single Python file | Easy to read, run, and demo; no unnecessary abstraction for a focused task |
 | ReAct loop (Thought/Action/Observation) | Lets the agent reason about errors and self-correct across up to 3 steps without external frameworks; works with both providers |
-| Anthropic + Gemini (no LangChain) | Direct SDK calls keep guardrail logic explicit; LangChain would bury the department filter inside framework internals |
+| Anthropic + Gemini (no LangChain) | Direct SDK calls keep the ReAct loop and guardrail checks fully visible with no added dependency weight |
 | System prompt + runtime guardrail | Defence-in-depth: LLM enforces the filter, runtime check is the hard safety net that cannot be prompt-injected away |
 | Per-branch UNION/INTERSECT/EXCEPT check | A valid first SELECT branch cannot mask an unfiltered second branch in a set operation |
 | `_is_select_only()` check | Blocks non-SELECT, multi-statement payloads, and disallowed DDL/DML keywords before they reach the database |
@@ -199,5 +200,5 @@ All queries and outcomes (OK, REPAIRED, REACT_RETRY, BLOCKED) are written to `lo
 **Claude Code (Anthropic CLI)** was used throughout development:
 
 - Drafted the initial `main.py` structure and system prompt
-- Suggested the two-layer guardrail design (system prompt + runtime SQL check)
 - Iterated on edge case handling (empty results, SQL errors, markdown fence stripping)
+- Tested guardrail robustness with adversarial prompts
