@@ -23,3 +23,6 @@ nl2sql
 
 # logs (keep the folder, ignore the contents)
 logs/*.log
+
+# local test
+test.py
