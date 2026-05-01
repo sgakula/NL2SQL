@@ -283,9 +283,10 @@ _DISALLOWED_KEYWORDS = re.compile(
 )
 
 def _is_select_only(sql: str) -> bool:
-    """Block anything that isn't a plain SELECT and reject multi-statement payloads."""
+    """Block anything that isn't a SELECT or CTE (WITH), and reject multi-statement payloads."""
     stripped = sql.strip().rstrip(";")
-    if not stripped.upper().startswith("SELECT"):
+    upper = stripped.upper()
+    if not (upper.startswith("SELECT") or upper.startswith("WITH")):
         return False
     if ";" in stripped:
         return False

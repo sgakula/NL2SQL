@@ -7,9 +7,11 @@ A console application that accepts natural language questions and answers them b
 ## Assumptions
 - `employees.db` is committed to the repository intentionally so the evaluator can run the application without any database setup. This would not be appropriate in a production environment.
 - Questions are assumed to be in English.
-- Modification requests (update, delete, insert) are out of scope — the spec describes read-only lookups and instructs candidates to document assumptions. These are rejected with a plain-language message.
-1- Conversation history is preserved for the duration of a session — follow-up questions and pronoun references ("those employees", "that person") resolve correctly within the same run. History resets when the application is restarted; there is no cross-session persistence.
+- Modification requests (update, delete, insert) are treated as out of scope. The spec frames the application as a question-answering and lookup tool, and all example queries are reads. DML operations are rejected with a plain-language message.
+- Conversation history is preserved for the duration of a session — follow-up questions and pronoun references ("those employees", "that person") resolve correctly within the same run. History resets when the application is restarted; there is no cross-session persistence.
 - Numeric results are rounded to 2 decimal places. Raw float values from SQLite (e.g. `143984.82333...`) are normalised by a Pydantic result model before display.
+- The LLM is instructed to add `LIMIT 25` to every query by default. Results are capped at 200 rows as a hard backstop. Users can ask for more rows explicitly (e.g. "show me all") and the LLM will omit the limit accordingly.
+- The ReAct loop attempts up to 3 Thought/Action/Observation steps per question. If a working query cannot be produced within 3 steps the question is declined with a plain-language message.
 - The guardrail applies at the SQL generation level; the application does not implement row-level security in the database itself.
 
 
