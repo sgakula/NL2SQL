@@ -17,6 +17,7 @@ import anthropic
 from google import genai
 from google.genai import types as genai_types
 from dotenv import load_dotenv
+from pydantic import BaseModel, field_validator
 
 load_dotenv()
 
@@ -31,6 +32,29 @@ logging.basicConfig(
 )
 _log = logging.getLogger("nl2sql")
 DEPARTMENTS = ["Sales", "Marketing", "Engineering"]
+MAX_ROWS = 200        # backstop — LLM defaults to LIMIT 25 via system prompt
+MAX_REACT_STEPS = 3  # max Thought/Action/Observation iterations per question
+
+class ResultRow(BaseModel):
+    values: list[Any]
+
+    @field_validator("values", mode="before")
+    @classmethod
+    def _format(cls, vals: list[Any]) -> list[Any]:
+        return [round(v, 2) if isinstance(v, float) else v for v in vals]
+
+
+class QueryResult(BaseModel):
+    columns: list[str]
+    rows: list[ResultRow]
+
+    @classmethod
+    def from_raw(cls, columns: list[str], rows: list[tuple]) -> "QueryResult":
+        return cls(columns=columns, rows=[ResultRow(values=list(r)) for r in rows])
+
+    def to_tuples(self) -> list[tuple]:
+        return [tuple(r.values) for r in self.rows]
+
 
 SCHEMA = """
 Database: employees.db (SQLite)
@@ -64,7 +88,7 @@ Benefits (
 
 
 def build_system_prompt(department: str) -> str:
-    return f"""You are a SQL query generator for a SQLite employee database.
+    return f"""You are a SQL query agent for a SQLite employee database.
 
 {SCHEMA}
 
@@ -81,16 +105,27 @@ This applies even when the user does not mention a department.
 Never return rows belonging to any other department.
 ═══════════════════════════════════════════════════════
 
+Response format — always use this structure:
+  Thought: <brief reasoning about what the question is asking and how to answer it>
+  Action: <raw SQLite SELECT statement — no markdown, no code fences>
+
+If the question cannot be answered with the available schema, or asks for
+a modification (update, delete, insert):
+  Thought: <reasoning>
+  INVALID_QUERY: <brief reason in plain language — no SQL keywords, no jargon>
+
+If the question is too vague or ambiguous:
+  Thought: <reasoning>
+  NEEDS_CLARIFICATION: <one specific question to ask the user in plain language>
+
+When you receive an Observation after an Action, reason about what went wrong
+and produce a corrected Thought and Action.
+
 Rules:
-1. Produce a single, valid SQLite SELECT statement.
-2. Always enforce the department filter described above.
-3. Return ONLY the raw SQL — no markdown, no code fences, no explanation.
-4. If the question cannot be answered with the available schema, or asks for
-   a modification (update, delete, insert), respond with exactly:
-   INVALID_QUERY: <brief reason in plain language for a non-technical user — no SQL keywords, no jargon>
-5. If the question is too vague or ambiguous to produce a correct query
-   (e.g. "show me some employees", "find that person"), respond with exactly:
-   NEEDS_CLARIFICATION: <one specific question to ask the user in plain language>
+1. In Action, produce a single valid SQLite SELECT statement.
+2. Always enforce the department filter above.
+3. By default add LIMIT 25 to every query. Omit LIMIT only when the user
+   explicitly asks for all results or a specific larger number.
 """
 
 
@@ -133,7 +168,7 @@ def _generate_sql(
     if provider == "anthropic":
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=512,
+            max_tokens=1024,
             system=system_prompt,
             messages=messages,
         )
@@ -156,11 +191,96 @@ def _generate_sql(
     return response.text.strip()
 
 
+def _extract_action(raw: str) -> str | None:
+    """Return the SQL that follows an 'Action:' label, or None if not found."""
+    idx = raw.lower().find("action:")
+    if idx == -1:
+        return None
+    return raw[idx + len("action:"):].strip()
+
+
+def _run_react_loop(
+    question: str,
+    system_prompt: str,
+    client: Any,
+    provider: str,
+    history: list[dict],
+    department: str,
+) -> tuple[QueryResult, str]:
+    """
+    ReAct loop: Thought → Action (SQL) → Observation → repeat.
+    Returns (QueryResult, sql) on success.
+    Raises ValueError for INVALID_QUERY / NEEDS_CLARIFICATION signals.
+    Raises RuntimeError if all steps are exhausted without a valid result.
+    """
+    react_history = list(history)
+    user_turn = question
+
+    for step in range(MAX_REACT_STEPS):
+        raw = _generate_sql(user_turn, system_prompt, client, provider, react_history)
+
+        # Detect special signals anywhere in the response
+        upper = raw.upper()
+        if "INVALID_QUERY:" in upper:
+            idx = upper.find("INVALID_QUERY:")
+            raise ValueError("INVALID_QUERY:" + raw[idx + len("INVALID_QUERY:"):].strip())
+        if "NEEDS_CLARIFICATION:" in upper:
+            idx = upper.find("NEEDS_CLARIFICATION:")
+            raise ValueError("NEEDS_CLARIFICATION:" + raw[idx + len("NEEDS_CLARIFICATION:"):].strip())
+
+        sql_raw = _extract_action(raw)
+        if not sql_raw:
+            raise ValueError("INVALID_QUERY: The question could not be understood.")
+
+        # Strip any accidental markdown fences
+        sql = re.sub(r"^```(?:sql)?\s*", "", sql_raw, flags=re.IGNORECASE)
+        sql = re.sub(r"\s*```$", "", sql).strip()
+
+        # Guardrail checks — feed violations back as observations so the LLM can self-correct
+        if not _is_select_only(sql):
+            observation = "That action was blocked: only read-only queries are permitted. Revise your query."
+        elif not _guardrail_passes(sql, department):
+            observation = (
+                f"That action was blocked: every query must filter by department "
+                f"'{department}'. Add WHERE Employee.Department = '{department}'."
+            )
+        else:
+            try:
+                columns, rows = _execute(sql)
+                status = "REPAIRED" if step > 0 else "OK"
+                _log.info(
+                    "[%s] %s | steps=%d | department=%s | question=%r | sql=%r",
+                    datetime.now().isoformat(timespec="seconds"),
+                    status,
+                    step + 1,
+                    department,
+                    question,
+                    sql,
+                )
+                return QueryResult.from_raw(columns, rows), sql
+            except sqlite3.Error as exc:
+                _log.info(
+                    "[%s] REACT_RETRY | step=%d | department=%s | question=%r | sql=%r | error=%r",
+                    datetime.now().isoformat(timespec="seconds"),
+                    step + 1,
+                    department,
+                    question,
+                    sql,
+                    str(exc),
+                )
+                observation = f"The query failed with error: {exc}. Fix it and try again."
+
+        react_history.append({"role": "user", "content": user_turn})
+        react_history.append({"role": "assistant", "content": raw})
+        user_turn = f"Observation: {observation}"
+
+    raise RuntimeError(f"Could not produce a working query after {MAX_REACT_STEPS} attempts.")
+
+
 _DISALLOWED_KEYWORDS = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER)\b",
     re.IGNORECASE,
 )
-
 
 def _is_select_only(sql: str) -> bool:
     """Block anything that isn't a plain SELECT and reject multi-statement payloads."""
@@ -176,11 +296,15 @@ def _is_select_only(sql: str) -> bool:
 
 def _guardrail_passes(sql: str, department: str) -> bool:
     """
-    Secondary safety check: confirm the SQL contains a department filter.
-    The system prompt is the primary guardrail; this is a defence-in-depth layer.
+    Secondary safety check: every SELECT branch must contain a department filter.
+    Splits on UNION so each branch is checked independently — prevents a valid
+    first branch from masking an unfiltered second branch.
     """
-    upper = sql.upper()
-    return "DEPARTMENT" in upper and department.upper() in upper
+    branches = re.split(r"\b(?:UNION(?:\s+ALL)?|INTERSECT|EXCEPT)\b", sql, flags=re.IGNORECASE)
+    return all(
+        "DEPARTMENT" in b.upper() and department.upper() in b.upper()
+        for b in branches
+    )
 
 
 def _execute(sql: str) -> tuple[list[str], list[tuple]]:
@@ -220,7 +344,7 @@ def _format_table(columns: list[str], rows: list[tuple]) -> str:
 
 
 def main() -> None:
-    provider = os.environ.get("LLM_PROVIDER", "anthropic").lower()
+    provider = os.environ.get("LLM_PROVIDER", "gemini").lower()
     client = _init_client(provider)
 
     department = random.choice(DEPARTMENTS)
@@ -230,7 +354,7 @@ def main() -> None:
     print("[INFO] Type a question, or 'exit' / 'quit' to stop.\n")
 
     system_prompt = build_system_prompt(department)
-    history: list[dict] = []
+    history: list[dict] = [] 
 
     while True:
         try:
@@ -245,83 +369,35 @@ def main() -> None:
             print("[INFO] Goodbye.")
             break
 
-        # ── Generate SQL ──────────────────────────────────────────────────────
+        # ── ReAct loop ────────────────────────────────────────────────────────
         try:
-            raw = _generate_sql(question, system_prompt, client, provider, history)
-        except Exception as exc:
-            print(f"[ERROR] LLM request failed: {exc}\n")
-            continue
-
-        # ── Handle unanswerable questions ─────────────────────────────────────
-        if raw.upper().startswith("INVALID_QUERY"):
-            reason = raw.split(":", 1)[1].strip() if ":" in raw else raw
-            print(f"  {reason}\n")
-            continue
-
-        # ── Ask for clarification when the question is too vague ──────────────
-        if raw.upper().startswith("NEEDS_CLARIFICATION"):
-            clarification_q = raw.split(":", 1)[1].strip() if ":" in raw else raw
-            print(f"  {clarification_q}\n")
-            history.append({"role": "user", "content": question})
-            history.append({"role": "assistant", "content": raw})
-            continue
-
-        # Strip any accidental markdown fences the model may have added
-        sql = re.sub(r"^```(?:sql)?\s*", "", raw, flags=re.IGNORECASE)
-        sql = re.sub(r"\s*```$", "", sql).strip()
-
-        # ── Reject non-SELECT / multi-statement SQL ───────────────────────────
-        if not _is_select_only(sql):
-            _log.info(
-                "[%s] UNSAFE | department=%s | question=%r | sql=%r",
-                datetime.now().isoformat(timespec="seconds"),
-                department,
-                question,
-                sql,
+            result, sql = _run_react_loop(
+                question, system_prompt, client, provider, history, department
             )
-            print("[BLOCKED] Query contains unsafe or non-SELECT statements. Refused.\n")
+        except ValueError as exc:
+            msg = str(exc)
+            if msg.upper().startswith("INVALID_QUERY:"):
+                print(f"  {msg.split(':', 1)[1].strip()}\n")
+            elif msg.upper().startswith("NEEDS_CLARIFICATION:"):
+                clarification_q = msg.split(":", 1)[1].strip()
+                print(f"  {clarification_q}\n")
+                history.append({"role": "user", "content": question})
+                history.append({"role": "assistant", "content": f"NEEDS_CLARIFICATION: {clarification_q}"})
             continue
-
-        # ── Guardrail validation (defence-in-depth) ───────────────────────────
-        if not _guardrail_passes(sql, department):
-            _log.info(
-                "[%s] BLOCKED | department=%s | question=%r | sql=%r",
-                datetime.now().isoformat(timespec="seconds"),
-                department,
-                question,
-                sql,
-            )
-            print(
-                f"[BLOCKED] Generated SQL does not filter by '{department}'. "
-                "Query refused.\n"
-            )
-            continue
-
-        _log.info(
-            "[%s] OK | department=%s | question=%r | sql=%r",
-            datetime.now().isoformat(timespec="seconds"),
-            department,
-            question,
-            sql,
-        )
-
-        # ── Execute ───────────────────────────────────────────────────────────
-        try:
-            columns, rows = _execute(sql)
-            print(_format_table(columns, rows))
-            # Record the exchange so follow-up questions have context
-            history.append({"role": "user", "content": question})
-            history.append({"role": "assistant", "content": sql})
-        except sqlite3.Error as exc:
-            _log.info(
-                "[%s] EXEC_ERROR | department=%s | question=%r | sql=%r | error=%r",
-                datetime.now().isoformat(timespec="seconds"),
-                department,
-                question,
-                sql,
-                str(exc),
-            )
+        except Exception:
             print("[ERROR] Could not retrieve results. Try rephrasing your question.\n")
+            continue
+
+        # ── Row cap ───────────────────────────────────────────────────────────
+        rows = result.to_tuples()
+        total = len(rows)
+        if total > MAX_ROWS:
+            rows = rows[:MAX_ROWS]
+            print(f"  Showing first {MAX_ROWS} of {total} results.\n")
+
+        print(_format_table(result.columns, rows))
+        history.append({"role": "user", "content": question})
+        history.append({"role": "assistant", "content": sql})
         print()
 
 
